@@ -1,0 +1,17 @@
+[Unit]
+Description=Xiaomi Scale → Garmin Connect
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/garmin
+ExecStart=/usr/bin/python3 /home/pi/garmin/xiaomi_scale.py
+Restart=on-failure
+RestartSec=15
+Environment=GARMIN_EMAIL=your@email.com
+Environment=GARMIN_PASSWORD=yourpassword
+
+[Install]
+WantedBy=multi-user.target
