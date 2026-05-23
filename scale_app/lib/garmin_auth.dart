@@ -45,6 +45,12 @@ class GarminAuth {
         });
 
       final loginResp = await _send(client, loginReq);
+      if (loginResp.statusCode == 429) {
+        throw Exception(
+          'Rate limited by Garmin (HTTP 429). Wait ~15–30 minutes before '
+          'trying again — each retry extends the cooldown.',
+        );
+      }
       if (loginResp.statusCode != 200) {
         final preview = _clip(loginResp.body, 200);
         throw Exception(

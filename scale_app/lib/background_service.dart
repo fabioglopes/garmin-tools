@@ -1,15 +1,16 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'garmin_client.dart';
+import 'body_composition.dart';
+import 'models.dart';
+import 'profile_matcher.dart';
+import 'scale_parser.dart';
+import 'store.dart';
+import 'uploader.dart';
 
 const _scaleUuid = '0000181b-0000-1000-8000-00805f9b34fb';
-const _cooldownSeconds = 300;
 
-int _lastUploadTime = 0;
 String? _lastSeenKey;
 
 @pragma('vm:entry-point')
@@ -33,7 +34,6 @@ void onServiceStart(ServiceInstance service) async {
     );
   }
 
-  // Wait for Bluetooth to be ready
   FlutterBluePlus.setLogLevel(LogLevel.error);
   await FlutterBluePlus.adapterState
       .where((s) => s == BluetoothAdapterState.on)
@@ -41,8 +41,6 @@ void onServiceStart(ServiceInstance service) async {
       .timeout(const Duration(seconds: 15), onTimeout: () => BluetoothAdapterState.unknown);
 
   final btState = await FlutterBluePlus.adapterState.first;
-  print('[Scale] Bluetooth state: $btState');
-
   if (btState != BluetoothAdapterState.on) {
     _notify(notifications, 'Scale Monitor', 'Bluetooth is off — turn it on and restart the service.');
     service.stopSelf();
@@ -66,104 +64,156 @@ Future<void> _runScanLoop(ServiceInstance service, FlutterLocalNotificationsPlug
 Future<void> _scanOnce(ServiceInstance service, FlutterLocalNotificationsPlugin notifications) async {
   final completer = Completer<void>();
 
-  print('[Scale] Starting BLE scan...');
   try {
-    await FlutterBluePlus.startScan(
-      timeout: const Duration(seconds: 30),
-    );
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 30));
   } catch (e) {
     print('[Scale] startScan error: $e');
     return;
   }
-  print('[Scale] Scan started');
 
   final sub = FlutterBluePlus.scanResults.listen((results) {
     for (final result in results) {
-      print('[Scale] Found device: ${result.device.remoteId} services=${result.advertisementData.serviceData.keys.toList()}');
       final uuid = Guid(_scaleUuid);
       final data = result.advertisementData.serviceData[uuid];
       if (data == null || data.length < 13) continue;
 
-      final parsed = _parseScale(data);
+      final parsed = parseScale(data);
       if (parsed == null || !parsed['stabilized']) continue;
 
-      // Dedup on scale's own timestamp + measurement (scale broadcasts the
-      // same advertisement repeatedly until you step off)
       final key = '${parsed['scale_ts']}-${parsed['weight']}-${parsed['impedance']}';
       if (key == _lastSeenKey) continue;
       _lastSeenKey = key;
 
-      // Use the phone's wall clock as the real measurement time. The scale's
-      // RTC is unreliable (often UTC even when set to local via Mi Fit), so
-      // trusting it leads to wrong dates in Garmin. The advertisement arrives
-      // within seconds of stepping on the scale, so "now" is accurate enough.
-      parsed['timestamp'] = DateTime.now().toUtc().toIso8601String();
+      // Use the phone's wall clock — scale's RTC is unreliable
+      final timestamp = DateTime.now().toUtc();
 
       if (!completer.isCompleted) completer.complete();
 
-      _handleMeasurement(service, notifications, parsed);
+      _handleMeasurement(service, notifications, parsed, timestamp);
     }
   });
 
   await Future.any([completer.future, Future.delayed(const Duration(seconds: 30))]);
   await sub.cancel();
   await FlutterBluePlus.stopScan();
-  print('[Scale] Scan ended');
 }
 
-void _handleMeasurement(
+Future<void> _handleMeasurement(
   ServiceInstance service,
   FlutterLocalNotificationsPlugin notifications,
   Map<String, dynamic> parsed,
+  DateTime timestamp,
 ) async {
-  final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-  if (now - _lastUploadTime < _cooldownSeconds) return;
+  final weight = (parsed['weight'] as num).toDouble();
+  final profiles = await Store.loadProfiles();
+  final match = matchProfile(weight, profiles);
 
-  final storage = const FlutterSecureStorage();
-  final height = double.tryParse(await storage.read(key: 'height') ?? '175') ?? 175;
-  final age    = int.tryParse(await storage.read(key: 'age') ?? '30') ?? 30;
-  final sex    = await storage.read(key: 'sex') ?? 'male';
+  final measurement = Measurement(
+    id: timestamp.microsecondsSinceEpoch.toString(),
+    profileId: match?.id,
+    timestamp: timestamp,
+    weight: weight,
+    unit: parsed['unit'] as String,
+    impedance: parsed['impedance'] as int?,
+  );
 
-  Map<String, dynamic> comp = {};
-  if (parsed['has_impedance'] == true) {
-    comp = _bodyComposition(
-      weight: parsed['weight'],
-      impedance: parsed['impedance'],
-      height: height,
-      age: age,
-      sex: sex,
+  // Body composition needs a profile (for height/age/sex)
+  Measurement enriched = measurement;
+  if (match != null && parsed['has_impedance'] == true) {
+    final comp = bodyComposition(
+      weight: weight,
+      impedance: parsed['impedance'] as int,
+      height: match.height,
+      age: match.ageOn(timestamp),
+      sex: match.sex,
+    );
+    enriched = Measurement(
+      id: measurement.id,
+      profileId: measurement.profileId,
+      timestamp: measurement.timestamp,
+      weight: measurement.weight,
+      unit: measurement.unit,
+      impedance: measurement.impedance,
+      fatPct:   comp['fat_pct'],
+      muscleKg: comp['muscle_kg'],
+      waterPct: comp['water_pct'],
+      bmi:      comp['bmi'],
     );
   }
 
-  // Send to UI
-  service.invoke('measurement', {...parsed, ...comp});
-
-  // Upload to Garmin
-  final token = await storage.read(key: 'garmin_access_token') ?? '';
-  if (token.isEmpty) {
-    _notify(notifications, 'Scale detected', 'Open the app → Settings → Login to Garmin to enable upload.');
+  // Dedup against recent measurements before persisting — the scale
+  // rebroadcasts for ~5 min after a weigh-in. Include soft-deleted entries
+  // so a deletion in the UI doesn't let the next replay re-create the record.
+  final existing = await Store.loadMeasurements(includeDeleted: true);
+  if (isDuplicateMeasurement(enriched, existing)) {
     return;
   }
 
-  try {
-    final client = GarminClient(token);
-    await client.uploadBodyComposition(
-      timestamp: DateTime.parse(parsed['timestamp']),
-      weight:    (parsed['weight'] as num).toDouble(),
-      height:    height,
-      percentFat:       (comp['fat_pct'] as num?)?.toDouble(),
-      percentHydration: (comp['water_pct'] as num?)?.toDouble(),
-      muscleKg:         (comp['muscle_kg'] as num?)?.toDouble(),
-    );
-    _lastUploadTime = now;
+  await Store.appendMeasurement(enriched);
+  service.invoke('measurement', enriched.toJson());
 
-    final msg = comp.isEmpty
-        ? '${parsed['weight'].toStringAsFixed(1)} kg uploaded'
-        : '${parsed['weight'].toStringAsFixed(1)} kg · ${comp['fat_pct']}% fat · ${comp['muscle_kg']} kg muscle';
-    _notify(notifications, 'Garmin updated ✓', msg);
-  } catch (e) {
-    _notify(notifications, 'Upload failed', e.toString());
+  if (match != null) {
+    await _updateExpectedWeight(profiles, match, weight);
+    await _uploadIfPossible(notifications, match, enriched);
+  } else {
+    await _notifyUnassigned(notifications, enriched, profiles);
   }
+}
+
+Future<void> _updateExpectedWeight(List<Profile> all, Profile match, double weight) async {
+  match.expectedWeight = weight;
+  await Store.saveProfiles(all);
+}
+
+Future<void> _uploadIfPossible(
+  FlutterLocalNotificationsPlugin notifications,
+  Profile profile,
+  Measurement m,
+) async {
+  if (!profile.hasGarmin) return;
+  try {
+    await uploadMeasurement(profile, m);
+    final msg = m.fatPct == null
+        ? '${m.weight.toStringAsFixed(1)} kg uploaded'
+        : '${m.weight.toStringAsFixed(1)} kg · ${m.fatPct}% fat · ${m.muscleKg} kg muscle';
+    _notify(notifications, '${profile.name} → Garmin ✓', msg);
+  } catch (e) {
+    _notify(notifications, 'Upload failed (${profile.name})', e.toString());
+  }
+}
+
+Future<void> _notifyUnassigned(
+  FlutterLocalNotificationsPlugin notifications,
+  Measurement m,
+  List<Profile> profiles,
+) async {
+  // Android caps action buttons at 3. Show up to two profiles + "Skip".
+  final picks = profiles.take(2).toList();
+  final actions = <AndroidNotificationAction>[
+    for (final p in picks)
+      AndroidNotificationAction('pid:${p.id}', p.name, showsUserInterface: false),
+    const AndroidNotificationAction('skip', 'Skip', showsUserInterface: false),
+  ];
+
+  final body = profiles.isEmpty
+      ? '${m.weight.toStringAsFixed(1)} kg — no profiles yet. Open app to add one.'
+      : '${m.weight.toStringAsFixed(1)} kg — no profile matched. Pick one:';
+
+  await notifications.show(
+    2,
+    'Unassigned measurement',
+    body,
+    NotificationDetails(
+      android: AndroidNotificationDetails(
+        'scale_results',
+        'Scale Results',
+        importance: Importance.high,
+        priority: Priority.high,
+        actions: actions,
+      ),
+    ),
+    payload: 'assign:${m.id}',
+  );
 }
 
 void _notify(FlutterLocalNotificationsPlugin n, String title, String body) {
@@ -182,73 +232,57 @@ void _notify(FlutterLocalNotificationsPlugin n, String title, String body) {
   );
 }
 
-Map<String, dynamic>? _parseScale(List<int> data) {
-  if (data.length < 13) return null;
+/// Background handler for notification action taps. Called by the OS in a
+/// separate isolate, so it needs the `vm:entry-point` pragma and cannot
+/// rely on shared in-memory state.
+@pragma('vm:entry-point')
+void onNotificationAction(NotificationResponse response) async {
+  final actionId = response.actionId;
+  final payload  = response.payload;
+  if (payload == null || !payload.startsWith('assign:')) return;
+  final mId = payload.substring('assign:'.length);
 
-  final ctrl1     = data[1];
-  final year      = data[2] | (data[3] << 8);
-  final month     = data[4];
-  final day       = data[5];
-  final hour      = data[6];
-  final minute    = data[7];
-  final second    = data[8];
-  final impedance = data[9] | (data[10] << 8);
-  final rawWeight = data[11] | (data[12] << 8);
+  if (actionId == 'skip' || actionId == null) return;
+  if (!actionId.startsWith('pid:')) return;
+  final pid = actionId.substring('pid:'.length);
 
-  final double weight;
-  final String unit;
-  if (ctrl1 & 0x10 != 0) {
-    weight = rawWeight / 100; unit = 'jin';
-  } else if (ctrl1 & 0x01 != 0) {
-    weight = rawWeight / 100; unit = 'lbs';
+  final all = await Store.loadMeasurements();
+  final i = all.indexWhere((m) => m.id == mId);
+  if (i == -1) return;
+  final m = all[i];
+  m.profileId = pid;
+
+  final profiles = await Store.loadProfiles();
+  final profile  = profiles.firstWhere((p) => p.id == pid, orElse: () => throw StateError('profile $pid not found'));
+
+  // Recompute body composition with chosen profile's body data, if impedance was captured
+  if (m.impedance != null) {
+    final comp = bodyComposition(
+      weight: m.weight,
+      impedance: m.impedance!,
+      height: profile.height,
+      age: profile.ageOn(m.timestamp),
+      sex: profile.sex,
+    );
+    final m2 = Measurement(
+      id: m.id, profileId: pid, timestamp: m.timestamp, weight: m.weight,
+      unit: m.unit, impedance: m.impedance,
+      fatPct: comp['fat_pct'], muscleKg: comp['muscle_kg'],
+      waterPct: comp['water_pct'], bmi: comp['bmi'],
+    );
+    all[i] = m2;
+    await Store.saveMeasurements(all);
+    profile.expectedWeight = m.weight;
+    await Store.saveProfiles(profiles);
+
+    final notif = FlutterLocalNotificationsPlugin();
+    await notif.initialize(const InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    ));
+    await _uploadIfPossible(notif, profile, m2);
   } else {
-    weight = rawWeight / 200; unit = 'kg';
+    await Store.saveMeasurements(all);
+    profile.expectedWeight = m.weight;
+    await Store.saveProfiles(profiles);
   }
-
-  final stabilized   = (ctrl1 & 0x20) != 0;
-  final hasImpedance = (ctrl1 & 0x02) != 0;
-  // Scale's own timestamp — used only for deduplication, not for display/upload
-  final scaleTs = '$year-$month-$day-$hour-$minute-$second';
-
-  return {
-    'scale_ts':      scaleTs,
-    'weight':        weight,
-    'unit':          unit,
-    'impedance':     hasImpedance ? impedance : null,
-    'stabilized':    stabilized,
-    'has_impedance': hasImpedance,
-  };
-}
-
-Map<String, dynamic> _bodyComposition({
-  required double weight,
-  required int impedance,
-  required double height,
-  required int age,
-  required String sex,
-}) {
-  final h = height / 100;
-  double lbm = (height * 9.058 / 100) * h + weight * 0.32 + 12.226;
-  lbm -= impedance * 0.0068 + age * 0.0542;
-
-  double fatPct;
-  if (sex == 'male') {
-    final coeff = age <= 30 ? 0.9462 : (age <= 45 ? 0.9 : 1.0);
-    fatPct = (1 - ((lbm - 0.8 + lbm * coeff * 0.05) / weight)) * 100;
-    fatPct = fatPct.clamp(5.0, 75.0);
-  } else {
-    fatPct = (1 - ((lbm - 0.8 + lbm * 0.05) / weight)) * 100;
-    fatPct = fatPct.clamp(10.0, 75.0);
-  }
-
-  final muscleKg = weight - (weight * fatPct / 100);
-  final waterPct = (muscleKg / weight) * 73.0;
-  final bmi      = weight / (h * h);
-
-  return {
-    'fat_pct':   double.parse(fatPct.toStringAsFixed(1)),
-    'muscle_kg': double.parse(muscleKg.toStringAsFixed(1)),
-    'water_pct': double.parse(waterPct.toStringAsFixed(1)),
-    'bmi':       double.parse(bmi.toStringAsFixed(1)),
-  };
 }

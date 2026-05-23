@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'background_service.dart';
-import 'garmin_client.dart';
-import 'garmin_native_login.dart';
-import 'garmin_webview_login.dart';
+import 'models.dart';
+import 'profiles_screen.dart';
+import 'store.dart';
+import 'uploader.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,7 +18,11 @@ void main() async {
 Future<void> _initNotifications() async {
   final plugin = FlutterLocalNotificationsPlugin();
   const android = AndroidInitializationSettings('@mipmap/ic_launcher');
-  await plugin.initialize(const InitializationSettings(android: android));
+  await plugin.initialize(
+    const InitializationSettings(android: android),
+    onDidReceiveNotificationResponse: onNotificationAction,
+    onDidReceiveBackgroundNotificationResponse: onNotificationAction,
+  );
 
   await plugin
       .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
@@ -67,26 +71,34 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final _service  = FlutterBackgroundService();
-  final _storage  = const FlutterSecureStorage();
-  bool _running   = false;
-  Map<String, dynamic>? _last;
-  bool _syncing   = false;
-  DateTime? _syncedAt;
-  String? _syncError;
+  final _service = FlutterBackgroundService();
+  bool _running = false;
+  List<Profile> _profiles = [];
+  List<Measurement> _measurements = [];
 
   @override
   void initState() {
     super.initState();
     _checkRunning();
-    _service.on('measurement').listen((data) {
-      if (data != null) setState(() { _last = data; _syncedAt = null; _syncError = null; });
-    });
+    _reload();
+    _service.on('measurement').listen((_) => _reload());
   }
 
   Future<void> _checkRunning() async {
     final r = await _service.isRunning();
-    setState(() => _running = r);
+    if (mounted) setState(() => _running = r);
+  }
+
+  Future<void> _reload() async {
+    final profiles = await Store.loadProfiles();
+    final measurements = await Store.loadMeasurements();
+    measurements.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    if (mounted) {
+      setState(() {
+        _profiles = profiles;
+        _measurements = measurements;
+      });
+    }
   }
 
   Future<void> _toggle() async {
@@ -96,7 +108,6 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // Request BLE + notification permissions
     await [
       Permission.bluetooth,
       Permission.bluetoothScan,
@@ -104,9 +115,8 @@ class _HomeScreenState extends State<HomeScreen> {
       Permission.notification,
     ].request();
 
-    final token = await _storage.read(key: 'garmin_access_token') ?? '';
-    if (token.isEmpty) {
-      _openSettings('Login to Garmin first — open Settings');
+    if (_profiles.isEmpty) {
+      _snack('Add a profile first — tap the people icon.');
       return;
     }
 
@@ -114,30 +124,90 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _running = true);
   }
 
-  void _openSettings([String? hint]) {
-    Navigator.push(context, MaterialPageRoute(builder: (_) => SettingsScreen(hint: hint)));
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  Future<void> _sync() async {
-    if (_last == null || _syncing) return;
-    setState(() { _syncing = true; _syncError = null; });
-    try {
-      final token  = await _storage.read(key: 'garmin_access_token') ?? '';
-      final height = double.tryParse(await _storage.read(key: 'height') ?? '175') ?? 175;
-      if (token.isEmpty) throw Exception('Not logged in — open Settings → Login to Garmin');
+  Future<void> _openProfiles() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfilesScreen()));
+    await _reload();
+  }
 
-      final client = GarminClient(token);
-      await client.uploadBodyComposition(
-        timestamp: DateTime.parse(_last!['timestamp']),
-        weight:    (_last!['weight'] as num).toDouble(),
-        height:    height,
-        percentFat:       (_last!['fat_pct'] as num?)?.toDouble(),
-        percentHydration: (_last!['water_pct'] as num?)?.toDouble(),
-        muscleKg:         (_last!['muscle_kg'] as num?)?.toDouble(),
-      );
-      setState(() { _syncedAt = DateTime.now(); _syncing = false; });
+  Future<void> _deleteMeasurement(Measurement m) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete measurement?'),
+        content: Text(
+          '${m.weight.toStringAsFixed(2)} ${m.unit} '
+          '${m.synced ? "(already synced to Garmin — deletion only removes the local copy)" : ""}',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await Store.deleteMeasurement(m.id);
+    await _reload();
+  }
+
+  Future<void> _syncMeasurement(Measurement m) async {
+    final profile = _profileFor(m);
+    if (profile == null) {
+      _snack('Assign a profile first.');
+      return;
+    }
+    if (!profile.hasGarmin) {
+      _snack('${profile.name} has no Garmin account.');
+      return;
+    }
+    _snack('Syncing ${profile.name}...');
+    try {
+      await uploadMeasurement(profile, m);
+      await _reload();
+      if (mounted) _snack('${profile.name} → Garmin ✓');
     } catch (e) {
-      setState(() { _syncError = e.toString(); _syncing = false; });
+      await _reload();
+      if (mounted) _snack('Sync failed: $e');
+    }
+  }
+
+  Future<void> _assignMeasurement(Measurement m) async {
+    if (_profiles.isEmpty) {
+      _snack('Add a profile first.');
+      return;
+    }
+    final picked = await showDialog<Profile>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Assign to profile'),
+        children: [
+          for (final p in _profiles)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, p),
+              child: Text('${p.name} (~${p.expectedWeight.toStringAsFixed(1)} kg)'),
+            ),
+        ],
+      ),
+    );
+    if (picked == null) return;
+    m.profileId = picked.id;
+    await Store.updateMeasurement(m);
+    await _reload();
+  }
+
+  Profile? _profileFor(Measurement m) {
+    if (m.profileId == null) return null;
+    try {
+      return _profiles.firstWhere((p) => p.id == m.profileId);
+    } catch (_) {
+      return null;
     }
   }
 
@@ -146,273 +216,174 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Scale → Garmin'),
-        actions: [IconButton(icon: const Icon(Icons.settings), onPressed: () => _openSettings())],
+        actions: [
+          IconButton(icon: const Icon(Icons.people), onPressed: _openProfiles),
+        ],
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                _running ? Icons.bluetooth_searching : Icons.bluetooth_disabled,
-                size: 80,
-                color: _running ? Colors.blue : Colors.grey,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                _running ? 'Listening for scale...' : 'Service stopped',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 8),
-              if (_running)
-                Text('Step on scale with bare feet', style: Theme.of(context).textTheme.bodySmall),
-              const SizedBox(height: 32),
-              FilledButton.icon(
-                onPressed: _toggle,
-                icon: Icon(_running ? Icons.stop : Icons.play_arrow),
-                label: Text(_running ? 'Stop' : 'Start'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: _running ? Colors.red : Colors.blue,
-                  minimumSize: const Size(180, 52),
-                ),
-              ),
-              if (_last != null) ...[
-                const SizedBox(height: 48),
-                _MeasurementCard(
-                  data:      _last!,
-                  onSync:    _syncedAt == null ? _sync : null,
-                  syncing:   _syncing,
-                  syncedAt:  _syncedAt,
-                  syncError: _syncError,
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _MeasurementCard extends StatelessWidget {
-  final Map<String, dynamic> data;
-  final VoidCallback? onSync;
-  final bool syncing;
-  final DateTime? syncedAt;
-  final String? syncError;
-
-  const _MeasurementCard({
-    required this.data,
-    required this.onSync,
-    required this.syncing,
-    required this.syncedAt,
-    required this.syncError,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final alreadySynced = syncedAt != null;
-    final h = syncedAt?.hour.toString().padLeft(2, '0');
-    final m = syncedAt?.minute.toString().padLeft(2, '0');
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text('Last measurement', style: Theme.of(context).textTheme.titleMedium),
-            Text(_formatLocal(data['timestamp']), style: Theme.of(context).textTheme.bodySmall),
-            const Divider(),
-            _row('Weight',  '${data['weight']?.toStringAsFixed(2)} ${data['unit']}'),
-            if (data['fat_pct'] != null)   _row('Body fat', '${data['fat_pct']}%'),
-            if (data['muscle_kg'] != null) _row('Muscle',   '${data['muscle_kg']} kg'),
-            if (data['water_pct'] != null) _row('Water',    '${data['water_pct']}%'),
-            if (data['bmi'] != null)       _row('BMI',      '${data['bmi']}'),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: alreadySynced || syncing ? null : onSync,
-              icon: syncing
-                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                  : Icon(alreadySynced ? Icons.check : Icons.cloud_upload),
-              label: Text(
-                syncing      ? 'Syncing...'
-                : alreadySynced ? 'Synced at $h:$m'
-                : 'Sync to Garmin',
-              ),
-            ),
-            if (syncError != null) ...[
-              const SizedBox(height: 8),
-              Text(syncError!, style: TextStyle(color: Theme.of(context).colorScheme.error, fontSize: 12)),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  static String _formatLocal(String? iso) {
-    if (iso == null || iso.isEmpty) return '';
-    try {
-      final dt = DateTime.parse(iso).toLocal();
-      String pad(int n) => n.toString().padLeft(2, '0');
-      return '${dt.year}-${pad(dt.month)}-${pad(dt.day)} ${pad(dt.hour)}:${pad(dt.minute)}';
-    } catch (_) {
-      return iso;
-    }
-  }
-
-  Widget _row(String label, String value) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 3),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label),
-        Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
-      ],
-    ),
-  );
-}
-
-class SettingsScreen extends StatefulWidget {
-  final String? hint;
-  const SettingsScreen({super.key, this.hint});
-  @override
-  State<SettingsScreen> createState() => _SettingsScreenState();
-}
-
-class _SettingsScreenState extends State<SettingsScreen> {
-  final _storage = const FlutterSecureStorage();
-  final _height  = TextEditingController();
-  final _age     = TextEditingController();
-  String _sex    = 'male';
-  bool _loggedIn = false;
-  bool _saved    = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    _height.text = await _storage.read(key: 'height') ?? '175';
-    _age.text    = await _storage.read(key: 'age')    ?? '30';
-    final sex    = await _storage.read(key: 'sex')    ?? 'male';
-    final token  = await _storage.read(key: 'garmin_access_token') ?? '';
-    setState(() { _sex = sex; _loggedIn = token.isNotEmpty; });
-  }
-
-  Future<void> _saveToken(String token, String? refresh) async {
-    await _storage.write(key: 'garmin_access_token', value: token);
-    if (refresh != null) await _storage.write(key: 'garmin_refresh_token', value: refresh);
-    if (!mounted) return;
-    setState(() => _loggedIn = true);
-    Navigator.pop(context);
-  }
-
-  Future<void> _openNativeLogin() async {
-    await Navigator.push(context, MaterialPageRoute(
-      builder: (_) => GarminNativeLogin(onTokenReceived: _saveToken),
-    ));
-  }
-
-  Future<void> _openWebViewLogin() async {
-    await Navigator.push(context, MaterialPageRoute(
-      builder: (_) => GarminWebViewLogin(onTokenReceived: _saveToken),
-    ));
-  }
-
-  Future<void> _logout() async {
-    await _storage.delete(key: 'garmin_access_token');
-    await _storage.delete(key: 'garmin_refresh_token');
-    setState(() => _loggedIn = false);
-  }
-
-  Future<void> _save() async {
-    await _storage.write(key: 'height', value: _height.text.trim());
-    await _storage.write(key: 'age',    value: _age.text.trim());
-    await _storage.write(key: 'sex',    value: _sex);
-    setState(() => _saved = true);
-    Future.delayed(const Duration(seconds: 1), () {
-      if (mounted) Navigator.pop(context);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
-        padding: const EdgeInsets.all(24),
+      body: Column(
         children: [
-          if (widget.hint != null)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: Text(widget.hint!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
-            ),
-
-          const Text('Garmin Account', style: TextStyle(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Icon(_loggedIn ? Icons.check_circle : Icons.cancel, color: _loggedIn ? Colors.green : Colors.grey),
-              const SizedBox(width: 8),
-              Text(_loggedIn ? 'Connected to Garmin' : 'Not connected'),
-            ],
-          ),
-          const SizedBox(height: 12),
-          if (_loggedIn)
-            OutlinedButton.icon(
-              onPressed: _logout,
-              icon: const Icon(Icons.logout),
-              label: const Text('Disconnect'),
-            )
-          else ...[
-            FilledButton.icon(
-              onPressed: _openNativeLogin,
-              icon: const Icon(Icons.login),
-              label: const Text('Login (Native, email + password)'),
-              style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: _openWebViewLogin,
-              icon: const Icon(Icons.public),
-              label: const Text('Login (WebView fallback)'),
-              style: OutlinedButton.styleFrom(minimumSize: const Size(0, 48)),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Try Native first — it uses the Chromium network stack and works '
-              'like the Python script. WebView is a fallback if Native fails.',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-          ],
-
-          const SizedBox(height: 32),
-          const Text('Body Profile', style: TextStyle(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          TextField(controller: _height, decoration: const InputDecoration(labelText: 'Height (cm)', border: OutlineInputBorder()), keyboardType: TextInputType.number),
-          const SizedBox(height: 12),
-          TextField(controller: _age,    decoration: const InputDecoration(labelText: 'Age',         border: OutlineInputBorder()), keyboardType: TextInputType.number),
-          const SizedBox(height: 12),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'male',   label: Text('Male')),
-              ButtonSegment(value: 'female', label: Text('Female')),
-            ],
-            selected: {_sex},
-            onSelectionChanged: (v) => setState(() => _sex = v.first),
-          ),
-          const SizedBox(height: 32),
-          FilledButton(
-            onPressed: _save,
-            child: Text(_saved ? 'Saved ✓' : 'Save'),
+          _StatusBar(running: _running, onToggle: _toggle),
+          Expanded(
+            child: _measurements.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(32),
+                      child: Text(
+                        'No measurements yet.\nStep on the scale with bare feet.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _measurements.length,
+                    itemBuilder: (_, i) => _MeasurementTile(
+                      m: _measurements[i],
+                      profile: _profileFor(_measurements[i]),
+                      onAssign: () => _assignMeasurement(_measurements[i]),
+                      onSync:   () => _syncMeasurement(_measurements[i]),
+                      onDelete: () => _deleteMeasurement(_measurements[i]),
+                    ),
+                  ),
           ),
         ],
       ),
     );
+  }
+}
+
+class _StatusBar extends StatelessWidget {
+  final bool running;
+  final VoidCallback onToggle;
+  const _StatusBar({required this.running, required this.onToggle});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      color: running ? Colors.blue.withValues(alpha: 0.1) : null,
+      child: Row(
+        children: [
+          Icon(
+            running ? Icons.bluetooth_searching : Icons.bluetooth_disabled,
+            color: running ? Colors.blue : Colors.grey,
+          ),
+          const SizedBox(width: 12),
+          Expanded(child: Text(running ? 'Listening for scale...' : 'Service stopped')),
+          FilledButton.icon(
+            onPressed: onToggle,
+            icon: Icon(running ? Icons.stop : Icons.play_arrow),
+            label: Text(running ? 'Stop' : 'Start'),
+            style: FilledButton.styleFrom(backgroundColor: running ? Colors.red : Colors.blue),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MeasurementTile extends StatelessWidget {
+  final Measurement m;
+  final Profile? profile;
+  final VoidCallback onAssign;
+  final VoidCallback onSync;
+  final VoidCallback onDelete;
+  const _MeasurementTile({
+    required this.m,
+    required this.profile,
+    required this.onAssign,
+    required this.onSync,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dt = m.timestamp.toLocal();
+    String pad(int n) => n.toString().padLeft(2, '0');
+    final dateStr =
+        '${dt.year}-${pad(dt.month)}-${pad(dt.day)} ${pad(dt.hour)}:${pad(dt.minute)}';
+
+    final unassigned = profile == null;
+    final title = unassigned
+        ? '${m.weight.toStringAsFixed(2)} ${m.unit} — unassigned'
+        : '${profile!.name} — ${m.weight.toStringAsFixed(2)} ${m.unit}';
+
+    final canSync = !unassigned && profile!.hasGarmin && !m.synced;
+
+    final action = unassigned
+        ? FilledButton(onPressed: onAssign, child: const Text('Assign'))
+        : canSync
+            ? FilledButton.icon(
+                onPressed: onSync,
+                icon: const Icon(Icons.cloud_upload, size: 18),
+                label: const Text('Sync'),
+              )
+            : null;
+
+    final trailing = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (action != null) action,
+        IconButton(
+          icon: const Icon(Icons.delete_outline, color: Colors.red),
+          tooltip: 'Delete',
+          onPressed: onDelete,
+        ),
+      ],
+    );
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: ListTile(
+        title: Text(
+          title,
+          style: TextStyle(
+            color: unassigned ? Colors.orange : null,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(dateStr),
+            if (m.fatPct != null) Text('Fat ${m.fatPct}% · Muscle ${m.muscleKg} kg · BMI ${m.bmi}'),
+            _SyncStatus(m: m, profile: profile),
+          ],
+        ),
+        trailing: trailing,
+        isThreeLine: true,
+      ),
+    );
+  }
+}
+
+class _SyncStatus extends StatelessWidget {
+  final Measurement m;
+  final Profile? profile;
+  const _SyncStatus({required this.m, required this.profile});
+
+  @override
+  Widget build(BuildContext context) {
+    String pad(int n) => n.toString().padLeft(2, '0');
+
+    if (m.synced && m.syncedAt != null) {
+      final t = m.syncedAt!.toLocal();
+      return Text(
+        'Synced ✓ ${pad(t.hour)}:${pad(t.minute)}',
+        style: const TextStyle(color: Colors.green, fontSize: 12),
+      );
+    }
+    if (m.syncError != null) {
+      return Text(
+        'Sync failed: ${m.syncError}',
+        style: const TextStyle(color: Colors.red, fontSize: 12),
+      );
+    }
+    if (profile == null) {
+      return const Text('Unassigned — pick a profile', style: TextStyle(color: Colors.orange, fontSize: 12));
+    }
+    if (!profile!.hasGarmin) {
+      return const Text('App-only — no Garmin upload', style: TextStyle(color: Colors.grey, fontSize: 12));
+    }
+    return const Text('Not synced', style: TextStyle(color: Colors.grey, fontSize: 12));
   }
 }
