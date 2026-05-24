@@ -21,6 +21,10 @@ bool isDuplicateMeasurement(
   final cutoffFuture = m.timestamp.add(window);
   for (final e in existing) {
     if (e.id == m.id) continue;
+    // Tombstone with a recorded deletion time: only suppress BLE rebroadcasts
+    // that arrived before the deletion. A re-weigh after the user deleted the
+    // record is a new legitimate measurement and must not be blocked.
+    if (e.deleted && e.deletedAt != null && m.timestamp.isAfter(e.deletedAt!)) continue;
     if (e.timestamp.isBefore(cutoffPast))   continue;
     if (e.timestamp.isAfter(cutoffFuture))  continue;
     if ((e.weight - m.weight).abs() <= weightTolerance) return true;
@@ -45,7 +49,12 @@ class Profile {
     required this.birthDate,
     required this.sex,
     this.garminEmail,
+    this.correctValues = false,
+    this.syncEnabled   = true,
   });
+
+  bool correctValues; // apply calibration corrections when uploading to Garmin
+  bool syncEnabled;   // false = skip Garmin upload even if credentials are set
 
   bool get hasGarmin => garminEmail != null && garminEmail!.isNotEmpty;
 
@@ -70,6 +79,8 @@ class Profile {
     'birth_date':      birthDate.toUtc().toIso8601String(),
     'sex':             sex,
     'garmin_email':    garminEmail,
+    'correct_values':  correctValues,
+    'sync_enabled':    syncEnabled,
   };
 
   factory Profile.fromJson(Map<String, dynamic> j) => Profile(
@@ -80,6 +91,8 @@ class Profile {
     birthDate:      _parseBirthDate(j),
     sex:            j['sex'] as String,
     garminEmail:    j['garmin_email'] as String?,
+    correctValues:  j['correct_values'] as bool? ?? false,
+    syncEnabled:    j['sync_enabled']   as bool? ?? true,
   );
 
   /// Read birth date from JSON, falling back to the legacy `age` field
@@ -111,6 +124,12 @@ class Measurement {
   DateTime? syncedAt;
   String?   syncError;
   bool      deleted;        // soft delete — hidden in UI but kept for dedup
+  DateTime? deletedAt;      // when the user deleted it; tombstone only blocks broadcasts before this
+  // User-entered reference values from an external device (e.g. Tanita).
+  // Used to build the calibration model for this profile.
+  double?   refFatPct;
+  double?   refMuscleKg;
+  double?   refWaterPct;
 
   Measurement({
     required this.id,
@@ -127,6 +146,10 @@ class Measurement {
     this.syncedAt,
     this.syncError,
     this.deleted   = false,
+    this.deletedAt,
+    this.refFatPct,
+    this.refMuscleKg,
+    this.refWaterPct,
   });
 
   Map<String, dynamic> toJson() => {
@@ -143,7 +166,11 @@ class Measurement {
     'synced':     synced,
     'synced_at':  syncedAt?.toUtc().toIso8601String(),
     'sync_error': syncError,
-    'deleted':    deleted,
+    'deleted':      deleted,
+    'deleted_at':   deletedAt?.toUtc().toIso8601String(),
+    'ref_fat_pct':  refFatPct,
+    'ref_muscle_kg': refMuscleKg,
+    'ref_water_pct': refWaterPct,
   };
 
   factory Measurement.fromJson(Map<String, dynamic> j) => Measurement(
@@ -161,5 +188,9 @@ class Measurement {
     syncedAt:   j['synced_at'] != null ? DateTime.parse(j['synced_at'] as String) : null,
     syncError:  j['sync_error'] as String?,
     deleted:    j['deleted'] as bool? ?? false,
+    deletedAt:  j['deleted_at'] != null ? DateTime.parse(j['deleted_at'] as String) : null,
+    refFatPct:   (j['ref_fat_pct']   as num?)?.toDouble(),
+    refMuscleKg: (j['ref_muscle_kg'] as num?)?.toDouble(),
+    refWaterPct: (j['ref_water_pct'] as num?)?.toDouble(),
   );
 }

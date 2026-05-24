@@ -64,6 +64,13 @@ Future<void> _runScanLoop(ServiceInstance service, FlutterLocalNotificationsPlug
 Future<void> _scanOnce(ServiceInstance service, FlutterLocalNotificationsPlugin notifications) async {
   final completer = Completer<void>();
 
+  // Buffer: collect the best stabilized packet for a short window after the
+  // first stable reading arrives. The Xiaomi scale emits weight-only packets
+  // first and adds impedance a second or two later — buffering lets us wait
+  // for the complete reading instead of saving a body-comp-free record.
+  Map<String, dynamic>? bestParsed;
+  DateTime? bestTimestamp;
+
   try {
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 30));
   } catch (e) {
@@ -78,18 +85,57 @@ Future<void> _scanOnce(ServiceInstance service, FlutterLocalNotificationsPlugin 
       if (data == null || data.length < 13) continue;
 
       final parsed = parseScale(data);
-      if (parsed == null || !parsed['stabilized']) continue;
+      if (parsed == null) continue;
 
-      final key = '${parsed['scale_ts']}-${parsed['weight']}-${parsed['impedance']}';
-      if (key == _lastSeenKey) continue;
-      _lastSeenKey = key;
+      // Emit every parsed packet to the debug screen (including unstabilized).
+      service.invoke('ble_event', {
+        'ts':            DateTime.now().toUtc().toIso8601String(),
+        'weight':        parsed['weight'],
+        'unit':          parsed['unit'],
+        'impedance':     parsed['impedance'],
+        'stabilized':    parsed['stabilized'],
+        'has_impedance': parsed['has_impedance'],
+      });
 
-      // Use the phone's wall clock — scale's RTC is unreliable
-      final timestamp = DateTime.now().toUtc();
+      if (!parsed['stabilized']) continue;
 
-      if (!completer.isCompleted) completer.complete();
+      final isFirst     = bestParsed == null;
+      final newHasImp   = parsed['has_impedance'] == true;
+      final bestHasImp  = bestParsed?['has_impedance'] == true;
+      // Only upgrade if weight is close — guards against a second person
+      // stepping on the scale during the buffer window.
+      final sameWeighIn = bestParsed == null ||
+          ((parsed['weight'] as num) - (bestParsed!['weight'] as num)).abs() < 0.5;
 
-      _handleMeasurement(service, notifications, parsed, timestamp);
+      if (bestParsed == null || (newHasImp && !bestHasImp && sameWeighIn)) {
+        bestParsed   = parsed;
+        bestTimestamp = DateTime.now().toUtc();
+      }
+
+      // On the first stabilized packet open a 5-second collection window.
+      // Any subsequent packet with impedance will upgrade bestParsed above.
+      // After 5 s we commit whichever packet is best.
+      if (isFirst) {
+        // Notify the UI immediately so the measurement appears in the list
+        // right away, even before body-comp data is available.
+        service.invoke('pending_measurement', {
+          'weight': parsed['weight'],
+          'unit':   parsed['unit'],
+        });
+
+        Future.delayed(const Duration(seconds: 5), () {
+          final best = bestParsed;
+          final ts   = bestTimestamp;
+          if (best != null && ts != null) {
+            final key = '${best['scale_ts']}-${best['weight']}-${best['impedance']}';
+            if (key != _lastSeenKey) {
+              _lastSeenKey = key;
+              _handleMeasurement(service, notifications, best, ts);
+            }
+          }
+          if (!completer.isCompleted) completer.complete();
+        });
+      }
     }
   });
 

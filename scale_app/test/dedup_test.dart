@@ -7,9 +7,10 @@ Measurement _m({
   required double w,
   int? imp,
   bool deleted = false,
+  DateTime? deletedAt,
 }) => Measurement(
   id: id, profileId: null, timestamp: ts, weight: w, unit: 'kg',
-  impedance: imp, deleted: deleted,
+  impedance: imp, deleted: deleted, deletedAt: deletedAt,
 );
 
 void main() {
@@ -59,11 +60,35 @@ void main() {
       expect(isDuplicateMeasurement(m, [m]), isFalse);
     });
 
-    test('soft-deleted measurement still suppresses re-creation', () {
+    test('soft-deleted measurement still suppresses BLE rebroadcasts', () {
       // The whole point of soft delete: dedup must keep seeing tombstones,
       // otherwise the scale's continued rebroadcasts re-create the entry.
-      final tombstone = _m(id: '1', ts: DateTime.utc(2024,1,1,10,0,0), w: 75.0, imp: 500, deleted: true);
-      final replay    = _m(id: '2', ts: DateTime.utc(2024,1,1,10,0,30), w: 75.0, imp: 500);
+      final deletedAt = DateTime.utc(2024,1,1,10,1,0);
+      final tombstone = _m(id: '1', ts: DateTime.utc(2024,1,1,10,0,0), w: 75.0, imp: 500,
+          deleted: true, deletedAt: deletedAt);
+      // Replay arrives 30 s after original measurement but BEFORE deletion → still blocked.
+      final replay = _m(id: '2', ts: DateTime.utc(2024,1,1,10,0,30), w: 75.0, imp: 500);
+      expect(isDuplicateMeasurement(replay, [tombstone]), isTrue);
+    });
+
+    test('tombstone does not block re-weigh that happens after the deletion', () {
+      // User deleted a weight-only measurement, then the person steps on the
+      // scale again. The new measurement's timestamp is after deletedAt, so
+      // the tombstone must be ignored.
+      final deletedAt = DateTime.utc(2024,1,1,10,1,0);
+      final tombstone = _m(id: '1', ts: DateTime.utc(2024,1,1,10,0,0), w: 75.0, imp: 500,
+          deleted: true, deletedAt: deletedAt);
+      // New attempt: same weight, arrives AFTER the user deleted.
+      final reWeigh = _m(id: '3', ts: DateTime.utc(2024,1,1,10,1,30), w: 75.0, imp: 500);
+      expect(isDuplicateMeasurement(reWeigh, [tombstone]), isFalse);
+    });
+
+    test('tombstone without deletedAt (legacy) still suppresses within window', () {
+      // Old tombstones stored before deletedAt was introduced have null deletedAt.
+      // They fall back to the original time-window dedup behavior.
+      final tombstone = _m(id: '1', ts: DateTime.utc(2024,1,1,10,0,0), w: 75.0, imp: 500,
+          deleted: true);
+      final replay = _m(id: '2', ts: DateTime.utc(2024,1,1,10,0,30), w: 75.0, imp: 500);
       expect(isDuplicateMeasurement(replay, [tombstone]), isTrue);
     });
   });

@@ -1,3 +1,4 @@
+import 'calibration.dart';
 import 'garmin_client.dart';
 import 'models.dart';
 import 'store.dart';
@@ -13,6 +14,9 @@ Future<void> uploadMeasurement(Profile profile, Measurement m) async {
   if (!profile.hasGarmin) {
     throw Exception('${profile.name} has no Garmin account configured.');
   }
+  if (!profile.syncEnabled) {
+    throw Exception('${profile.name}: sync is disabled. Enable it in the profile settings.');
+  }
   final password = await Store.readPassword(profile.id);
   if (password == null || password.isEmpty) {
     throw Exception('${profile.name}: password not stored. Open profile → Login.');
@@ -26,14 +30,29 @@ Future<void> uploadMeasurement(Profile profile, Measurement m) async {
     onTokenRefreshed: (t, _) => Store.saveToken(profile.id, t),
   );
 
+  // Resolve which body-comp values to send.
+  double? uploadFat    = m.fatPct;
+  double? uploadMuscle = m.muscleKg;
+  double? uploadWater  = m.waterPct;
+  if (profile.correctValues && m.fatPct != null) {
+    final all = await Store.loadMeasurements(includeDeleted: false);
+    final forProfile = all.where((x) => x.profileId == profile.id).toList();
+    final cal = computeCalibration(m, forProfile);
+    if (cal.hasAny) {
+      uploadFat    = cal.fatPct    ?? uploadFat;
+      uploadMuscle = cal.muscleKg  ?? uploadMuscle;
+      uploadWater  = cal.waterPct  ?? uploadWater;
+    }
+  }
+
   try {
     await client.uploadBodyComposition(
       timestamp:        m.timestamp,
       weight:           m.weight,
       height:           profile.height,
-      percentFat:       m.fatPct,
-      percentHydration: m.waterPct,
-      muscleKg:         m.muscleKg,
+      percentFat:       uploadFat,
+      percentHydration: uploadWater,
+      muscleKg:         uploadMuscle,
     );
     m.synced    = true;
     m.syncedAt  = DateTime.now();

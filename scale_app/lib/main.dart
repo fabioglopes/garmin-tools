@@ -3,6 +3,8 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'background_service.dart';
+import 'debug_screen.dart';
+import 'measurement_detail_screen.dart';
 import 'models.dart';
 import 'profiles_screen.dart';
 import 'store.dart';
@@ -75,13 +77,20 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _running = false;
   List<Profile> _profiles = [];
   List<Measurement> _measurements = [];
+  Map<String, dynamic>? _pending; // first stabilized packet, buffer still open
 
   @override
   void initState() {
     super.initState();
     _checkRunning();
     _reload();
-    _service.on('measurement').listen((_) => _reload());
+    _service.on('pending_measurement').listen((data) {
+      if (data != null && mounted) setState(() => _pending = data);
+    });
+    _service.on('measurement').listen((_) {
+      if (mounted) setState(() => _pending = null);
+      _reload();
+    });
   }
 
   Future<void> _checkRunning() async {
@@ -217,6 +226,22 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Scale → Garmin'),
         actions: [
+          if (_pending != null)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: 'Live BLE events',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DebugScreen()),
+            ),
+          ),
           IconButton(icon: const Icon(Icons.people), onPressed: _openProfiles),
         ],
       ),
@@ -235,14 +260,33 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   )
                 : ListView.builder(
-                    itemCount: _measurements.length,
-                    itemBuilder: (_, i) => _MeasurementTile(
-                      m: _measurements[i],
-                      profile: _profileFor(_measurements[i]),
-                      onAssign: () => _assignMeasurement(_measurements[i]),
-                      onSync:   () => _syncMeasurement(_measurements[i]),
-                      onDelete: () => _deleteMeasurement(_measurements[i]),
-                    ),
+                    itemCount: _measurements.length + (_pending != null ? 1 : 0),
+                    itemBuilder: (_, i) {
+                      if (_pending != null && i == 0) {
+                        return _PendingTile(pending: _pending!);
+                      }
+                      final m = _measurements[_pending != null ? i - 1 : i];
+                      final profile = _profileFor(m);
+                      return _MeasurementTile(
+                        m: m,
+                        profile: profile,
+                        onTap: () async {
+                          await Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => MeasurementDetailScreen(
+                                measurement: m,
+                                profile: profile,
+                              ),
+                            ),
+                          );
+                          await _reload();
+                        },
+                        onAssign: () => _assignMeasurement(m),
+                        onSync:   () => _syncMeasurement(m),
+                        onDelete: () => _deleteMeasurement(m),
+                      );
+                    },
                   ),
           ),
         ],
@@ -284,12 +328,14 @@ class _StatusBar extends StatelessWidget {
 class _MeasurementTile extends StatelessWidget {
   final Measurement m;
   final Profile? profile;
+  final VoidCallback onTap;
   final VoidCallback onAssign;
   final VoidCallback onSync;
   final VoidCallback onDelete;
   const _MeasurementTile({
     required this.m,
     required this.profile,
+    required this.onTap,
     required this.onAssign,
     required this.onSync,
     required this.onDelete,
@@ -307,7 +353,7 @@ class _MeasurementTile extends StatelessWidget {
         ? '${m.weight.toStringAsFixed(2)} ${m.unit} — unassigned'
         : '${profile!.name} — ${m.weight.toStringAsFixed(2)} ${m.unit}';
 
-    final canSync = !unassigned && profile!.hasGarmin && !m.synced;
+    final canSync = !unassigned && profile!.hasGarmin && profile!.syncEnabled && !m.synced;
 
     final action = unassigned
         ? FilledButton(onPressed: onAssign, child: const Text('Assign'))
@@ -334,6 +380,7 @@ class _MeasurementTile extends StatelessWidget {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       child: ListTile(
+        onTap: onTap,
         title: Text(
           title,
           style: TextStyle(
@@ -351,6 +398,32 @@ class _MeasurementTile extends StatelessWidget {
         ),
         trailing: trailing,
         isThreeLine: true,
+      ),
+    );
+  }
+}
+
+class _PendingTile extends StatelessWidget {
+  final Map<String, dynamic> pending;
+  const _PendingTile({required this.pending});
+
+  @override
+  Widget build(BuildContext context) {
+    final weight = (pending['weight'] as num).toDouble();
+    final unit   = pending['unit'] as String;
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: ListTile(
+        leading: const SizedBox(
+          width: 24, height: 24,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        title: Text(
+          '${weight.toStringAsFixed(2)} $unit',
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        subtitle: const Text('Collecting body composition data...'),
+        trailing: const Icon(Icons.hourglass_top, color: Colors.grey),
       ),
     );
   }
@@ -383,6 +456,9 @@ class _SyncStatus extends StatelessWidget {
     }
     if (!profile!.hasGarmin) {
       return const Text('App-only — no Garmin upload', style: TextStyle(color: Colors.grey, fontSize: 12));
+    }
+    if (!profile!.syncEnabled) {
+      return const Text('Sync disabled', style: TextStyle(color: Colors.orange, fontSize: 12));
     }
     return const Text('Not synced', style: TextStyle(color: Colors.grey, fontSize: 12));
   }

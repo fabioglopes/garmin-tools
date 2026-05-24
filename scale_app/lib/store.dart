@@ -91,6 +91,7 @@ class Store {
     final i = all.indexWhere((m) => m.id == id);
     if (i == -1) return;
     all[i].deleted = true;
+    all[i].deletedAt = DateTime.now().toUtc();
     await saveMeasurements(all);
   }
 

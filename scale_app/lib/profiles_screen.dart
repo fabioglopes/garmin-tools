@@ -105,6 +105,8 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
   bool _showPassword = false;
   String _sex = 'male';
   DateTime _birthDate = DateTime.utc(1990, 1, 1);
+  bool _correctValues = false;
+  bool _syncEnabled   = true;
   bool _loggedIn = false;
   bool _loginInProgress = false;
   String? _loginError;
@@ -117,12 +119,14 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
     final p = widget.profile;
     if (p != null) {
       _id = p.id;
-      _name.text   = p.name;
-      _weight.text = p.expectedWeight.toString();
-      _height.text = p.height.toStringAsFixed(0);
-      _birthDate   = p.birthDate;
-      _sex         = p.sex;
-      _email.text  = p.garminEmail ?? '';
+      _name.text     = p.name;
+      _weight.text   = p.expectedWeight.toString();
+      _height.text   = p.height.toStringAsFixed(0);
+      _birthDate     = p.birthDate;
+      _sex           = p.sex;
+      _correctValues = p.correctValues;
+      _syncEnabled   = p.syncEnabled;
+      _email.text    = p.garminEmail ?? '';
     } else {
       _id = DateTime.now().microsecondsSinceEpoch.toString();
       _weight.text = '70';
@@ -235,7 +239,9 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
       height: height,
       birthDate: _birthDate,
       sex: _sex,
-      garminEmail: email.isEmpty ? null : email,
+      garminEmail:   email.isEmpty ? null : email,
+      correctValues: _correctValues,
+      syncEnabled:   _syncEnabled,
     );
 
     final all = await Store.loadProfiles();
@@ -290,6 +296,25 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
             onSelectionChanged: (v) => setState(() => _sex = v.first),
           ),
           const SizedBox(height: 32),
+          SwitchListTile(
+            value: _syncEnabled,
+            onChanged: (v) => setState(() => _syncEnabled = v),
+            title: const Text('Sync to Garmin'),
+            subtitle: const Text('Uncheck to stop uploading measurements to Garmin Connect.'),
+            contentPadding: EdgeInsets.zero,
+          ),
+          SwitchListTile(
+            value: _correctValues,
+            onChanged: (v) => setState(() => _correctValues = v),
+            title: const Text('Correct values before upload'),
+            subtitle: const Text(
+              'Apply calibration offsets (set in measurement detail) '
+              'when sending body composition to Garmin.',
+            ),
+            contentPadding: EdgeInsets.zero,
+          ),
+          const Divider(),
+          const SizedBox(height: 8),
           const Text('Garmin (optional)', style: TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           const Text('Leave blank for app-only profiles (no upload).',
