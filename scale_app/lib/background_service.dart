@@ -150,7 +150,7 @@ Future<void> _handleMeasurement(
   Map<String, dynamic> parsed,
   DateTime timestamp,
 ) async {
-  final weight = (parsed['weight'] as num).toDouble();
+  final weight = floorToTenthKg((parsed['weight'] as num).toDouble());
   final profiles = await Store.loadProfiles();
   final match = matchProfile(weight, profiles);
 
@@ -201,6 +201,9 @@ Future<void> _handleMeasurement(
   if (match != null) {
     await _updateExpectedWeight(profiles, match, weight);
     await _uploadIfPossible(notifications, match, enriched);
+    // _uploadIfPossible updated synced/syncedAt in storage; re-notify so the
+    // UI reloads and drops the "Not synced" label + Sync button.
+    service.invoke('measurement', enriched.toJson());
   } else {
     await _notifyUnassigned(notifications, enriched, profiles);
   }

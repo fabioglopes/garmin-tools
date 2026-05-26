@@ -32,6 +32,15 @@ bool isDuplicateMeasurement(
   return false;
 }
 
+/// Floor a weight down to the nearest 0.1 kg. The Xiaomi scale resolves to
+/// 0.005 kg, so round to integer grams first (clearing float noise) before
+/// truncating. Garmin rounds half-up on its side (75.05 → 75.1); flooring here
+/// makes it land on 75.0 instead.
+double floorToTenthKg(double kg) {
+  final grams = (kg * 1000).round();
+  return (grams - grams % 100) / 1000;
+}
+
 class Profile {
   final String id;
   String name;
