@@ -116,6 +116,53 @@ class GarminAuth {
     }
   }
 
+  /// Mint a fresh access token from a stored refresh token (OAuth2 refresh
+  /// grant). Works without a password, so it keeps MFA/token-only profiles
+  /// uploading until the refresh token itself expires (~1 year). Garmin may
+  /// return a rotated refresh token; if so we surface it so the caller can
+  /// persist the new one.
+  static Future<GarminAuthResult> refreshAccessToken(String refreshToken) async {
+    final engine = CronetEngine.build(
+      cacheMode: CacheMode.disabled,
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) '
+          'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    );
+    final client = CronetClient.fromCronetEngine(engine);
+    const diClientId = 'GARMIN_CONNECT_MOBILE_IOS_DI';
+    try {
+      final authHeader = 'Basic ${base64.encode(utf8.encode('$diClientId:'))}';
+      final req = http.Request('POST', Uri.parse(_diTokenUrl))
+        ..headers['Authorization'] = authHeader
+        ..headers['Content-Type']  = 'application/x-www-form-urlencoded'
+        ..headers['Accept']        = 'application/json,text/html;q=0.9,*/*;q=0.8'
+        ..headers['User-Agent']    = 'GCM-iOS-5.23'
+        ..bodyFields = {
+          'client_id':     diClientId,
+          'grant_type':    'refresh_token',
+          'refresh_token': refreshToken,
+        };
+
+      final resp = await _send(client, req);
+      if (resp.statusCode != 200) {
+        throw Exception('Token refresh failed (${resp.statusCode}): ${_clip(resp.body, 200)}');
+      }
+      final data = _safeJsonObject(resp.body)
+          ?? (throw Exception('Refresh response not JSON object: ${_clip(resp.body, 200)}'));
+      final accessToken = data['access_token'] as String?;
+      if (accessToken == null || accessToken.isEmpty) {
+        throw Exception('Refresh response missing access_token: ${_clip(resp.body, 200)}');
+      }
+      // Keep the existing refresh token if Garmin didn't rotate it.
+      final newRefresh = data['refresh_token'] as String?;
+      return GarminAuthResult(
+        accessToken,
+        (newRefresh != null && newRefresh.isNotEmpty) ? newRefresh : refreshToken,
+      );
+    } finally {
+      client.close();
+    }
+  }
+
   static Future<GarminAuthResult> _exchangeTicket(
     http.Client client, String ticket, String diClientId, {String? serviceUrl}
   ) async {

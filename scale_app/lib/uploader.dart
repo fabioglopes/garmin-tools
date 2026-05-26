@@ -17,19 +17,28 @@ Future<void> uploadMeasurement(Profile profile, Measurement m) async {
   if (!profile.syncEnabled) {
     throw Exception('${profile.name}: sync is disabled. Enable it in the profile settings.');
   }
-  final password = await Store.readPassword(profile.id);
-  final token    = await Store.readToken(profile.id);
-  // Need at least one: a token to upload with, or a password to fetch one.
-  // MFA/token-only profiles have just a token (no auto-refresh on expiry).
-  if ((token == null || token.isEmpty) && (password == null || password.isEmpty)) {
+  final password     = await Store.readPassword(profile.id);
+  final token        = await Store.readToken(profile.id);
+  final refreshToken = await Store.readRefreshToken(profile.id);
+  // Need at least one credential: an access token to upload with, a refresh
+  // token to mint one, or a password to log in.
+  if ((token == null || token.isEmpty) &&
+      (refreshToken == null || refreshToken.isEmpty) &&
+      (password == null || password.isEmpty)) {
     throw Exception('${profile.name}: not logged in. Open profile → Login.');
   }
 
   final client = GarminClient(
     email: profile.garminEmail!,
-    password: password, // null for MFA/token-only profiles
+    password: password,         // null for MFA/token-only profiles
     token: token,
-    onTokenRefreshed: (t, _) => Store.saveToken(profile.id, t),
+    refreshToken: refreshToken, // used to auto-renew without a password
+    onTokenRefreshed: (t, refresh) async {
+      await Store.saveToken(profile.id, t);
+      if (refresh != null && refresh.isNotEmpty) {
+        await Store.saveRefreshToken(profile.id, refresh);
+      }
+    },
   );
 
   // Resolve which body-comp values to send.

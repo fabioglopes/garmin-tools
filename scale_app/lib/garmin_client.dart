@@ -10,18 +10,21 @@ import 'garmin_auth.dart';
 /// persist it.
 class GarminClient {
   final String  email;
-  final String? password; // null for MFA/token-only profiles (no auto-refresh)
+  final String? password; // null for MFA/token-only profiles
   final void Function(String accessToken, String? refreshToken)? onTokenRefreshed;
 
   String? _token;
+  String? _refreshToken;
   final Dio _dio;
 
   GarminClient({
     required this.email,
     this.password,
     String? token,
+    String? refreshToken,
     this.onTokenRefreshed,
   })  : _token = token,
+        _refreshToken = refreshToken,
         _dio = Dio(BaseOptions(
           headers: {
             'Accept':                   'application/json',
@@ -96,12 +99,31 @@ class GarminClient {
   }
 
   Future<void> _refresh() async {
+    // Prefer the refresh token — it works without a password, so MFA/token-only
+    // profiles keep uploading until the refresh token expires (~1 year).
+    if (_refreshToken != null && _refreshToken!.isNotEmpty) {
+      try {
+        final r = await GarminAuth.refreshAccessToken(_refreshToken!);
+        _token        = r.accessToken;
+        _refreshToken = r.refreshToken ?? _refreshToken;
+        onTokenRefreshed?.call(_token!, _refreshToken);
+        return;
+      } catch (e) {
+        // Refresh token expired/revoked — fall back to password if we have one.
+        if (password == null || password!.isEmpty) {
+          throw Exception('Token refresh failed and no password is stored. '
+              'Re-login in the profile (WebView/MFA) or paste a fresh token. ($e)');
+        }
+      }
+    }
+
     if (password == null || password!.isEmpty) {
-      throw Exception('Token expired and no password is stored to refresh it. '
+      throw Exception('Token expired and no refresh token or password is stored. '
           'Open the profile and log in again (WebView/MFA) or paste a fresh token.');
     }
     final r = await GarminAuth.login(email, password!);
-    _token = r.accessToken;
+    _token        = r.accessToken;
+    _refreshToken = r.refreshToken ?? _refreshToken;
     onTokenRefreshed?.call(r.accessToken, r.refreshToken);
   }
 }
