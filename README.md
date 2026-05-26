@@ -92,15 +92,64 @@ An Android app that does the same thing from your phone — no Raspberry Pi need
 
 ### Build & install
 
+#### Prerequisites
+
+- [Flutter SDK](https://docs.flutter.dev/get-started/install) installed and on your `PATH` (`flutter --version` should work)
+- Android phone with **USB debugging** enabled:
+  - Settings → About phone → tap **Build number** 7 times to unlock Developer options
+  - Settings → Developer options → enable **USB debugging**
+- USB cable (or set up wireless ADB — see below)
+
+Verify everything is ready:
+
 ```bash
-cd scale_app
-flutter run -d <device-id> --release   # build + install in one step
-# or build APK only:
-flutter build apk --release
-adb install -r build/app/outputs/flutter-apk/app-release.apk
+flutter doctor          # should show no errors for Android toolchain
+adb devices             # should list your phone (e.g. "R58Mxxxxxx device")
 ```
 
-List connected devices with `flutter devices`.
+If `adb devices` shows `unauthorized`, unlock your phone and tap **Allow** on the USB debugging prompt.
+
+#### Option A — build + install in one step (USB)
+
+```bash
+cd scale_app
+flutter devices                         # find your device id
+flutter run -d <device-id> --release    # builds and installs directly
+```
+
+`<device-id>` is the serial from `flutter devices`, e.g. `R58M704XXXX`. You can omit `-d` if only one device is connected.
+
+#### Option B — build APK, then sideload
+
+```bash
+cd scale_app
+flutter build apk --release
+# APK is at:
+#   build/app/outputs/flutter-apk/app-release.apk
+
+adb install build/app/outputs/flutter-apk/app-release.apk
+```
+
+Replaces any existing install without wiping data.
+
+#### Option C — wireless (no USB after first setup)
+
+On Android 11+:
+
+```bash
+# 1. Connect once via USB and pair
+adb tcpip 5555
+adb connect <phone-ip>:5555   # find phone IP in Settings → About → Status
+
+# 2. Disconnect USB — wireless ADB stays active until reboot
+flutter run -d <phone-ip>:5555 --release
+```
+
+On Android 11+ you can also use **Developer options → Wireless debugging** and pair with a QR code (`adb pair`).
+
+#### Updating after code changes
+
+Re-run whichever option you used — `flutter run --release` rebuilds only changed files. App data (profiles, measurements, tokens) is preserved across installs.
 
 ### Setup
 
@@ -141,7 +190,10 @@ Tap any measurement to see:
 
 - Native login: POST JSON credentials to `sso.garmin.com/mobile/api/login` → service ticket → POST to `diauth.garmin.com` for a DI OAuth2 bearer token
 - The bearer token authenticates against `connectapi.garmin.com` (Garmin's mobile API)
-- Accounts with MFA must use **Login (WebView — MFA)** — note this captures the token but not the password, so auto-refresh will not work
+- **MFA accounts** have two options:
+  - **Login (WebView — MFA)** — opens Garmin's login page in a WebView; complete login + MFA code there; the app exchanges the session cookie for a DI OAuth2 token automatically and closes the screen
+  - **Paste token manually** — run `python3 get_data.py` (or `upload_body_composition.py`) on a desktop/Pi; the script prints the access + refresh tokens after login; paste the access token into the app. Token expires in ~1 hour
+- Both WebView and manual-paste logins capture the token only (not the password), so auto-refresh on 401 does not work — you will need to re-login when the token expires
 - Garmin rate-limits login attempts (HTTP 429, Cloudflare). If this happens, wait 15–30 minutes before retrying. Passwords are saved before the login attempt so the next measurement will trigger an automatic retry
 
 ### Body composition formula

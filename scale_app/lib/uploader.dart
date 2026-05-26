@@ -18,14 +18,16 @@ Future<void> uploadMeasurement(Profile profile, Measurement m) async {
     throw Exception('${profile.name}: sync is disabled. Enable it in the profile settings.');
   }
   final password = await Store.readPassword(profile.id);
-  if (password == null || password.isEmpty) {
-    throw Exception('${profile.name}: password not stored. Open profile → Login.');
+  final token    = await Store.readToken(profile.id);
+  // Need at least one: a token to upload with, or a password to fetch one.
+  // MFA/token-only profiles have just a token (no auto-refresh on expiry).
+  if ((token == null || token.isEmpty) && (password == null || password.isEmpty)) {
+    throw Exception('${profile.name}: not logged in. Open profile → Login.');
   }
-  final token = await Store.readToken(profile.id);
 
   final client = GarminClient(
     email: profile.garminEmail!,
-    password: password,
+    password: password, // null for MFA/token-only profiles
     token: token,
     onTokenRefreshed: (t, _) => Store.saveToken(profile.id, t),
   );

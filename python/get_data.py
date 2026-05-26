@@ -15,6 +15,20 @@ password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
 client = Garmin(email, password)
 client.login()
 
+try:
+    tok = client.garth.oauth2_token
+    import datetime
+    expires = datetime.datetime.fromtimestamp(tok.expires_at).strftime('%Y-%m-%d %H:%M:%S')
+    print("\n" + "=" * 52)
+    print("  GARMIN TOKENS — paste into Android app")
+    print("=" * 52)
+    print(f"Access token:  {tok.access_token}")
+    print(f"Refresh token: {tok.refresh_token}")
+    print(f"Expires at:    {expires} (local) — ~1 hour")
+    print("=" * 52 + "\n")
+except Exception as _e:
+    print(f"(Could not extract tokens: {_e})")
+
 sections = {
     "User summary": lambda: client.get_user_summary(today),
     "Body composition": lambda: client.get_body_composition(today, today),

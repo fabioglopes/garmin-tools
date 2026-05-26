@@ -95,8 +95,29 @@ class GarminAuth {
     }
   }
 
+  /// Exchange an SSO service ticket for a DI OAuth2 token without needing the
+  /// full login flow. Used by the WebView login to bypass the JavaScript fetch
+  /// approach (which fails with ERR_BLOCKED_BY_ORB due to cross-origin redirects).
+  ///
+  /// [serviceUrl] must match the `service` the ticket was issued for. Defaults
+  /// to the mobile service used by the native login.
+  static Future<GarminAuthResult> exchangeTicket(String ticket, {String? serviceUrl}) async {
+    final engine = CronetEngine.build(
+      cacheMode: CacheMode.disabled,
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) '
+          'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    );
+    final client = CronetClient.fromCronetEngine(engine);
+    try {
+      return await _exchangeTicket(client, ticket, 'GARMIN_CONNECT_MOBILE_IOS_DI',
+          serviceUrl: serviceUrl);
+    } finally {
+      client.close();
+    }
+  }
+
   static Future<GarminAuthResult> _exchangeTicket(
-    http.Client client, String ticket, String diClientId,
+    http.Client client, String ticket, String diClientId, {String? serviceUrl}
   ) async {
     final authHeader = 'Basic ${base64.encode(utf8.encode('$diClientId:'))}';
 
@@ -109,7 +130,7 @@ class GarminAuth {
         'client_id':      diClientId,
         'service_ticket': ticket,
         'grant_type':     _diGrantType,
-        'service_url':    _mobileService,
+        'service_url':    serviceUrl ?? _mobileService,
       };
 
     final resp = await _send(client, req);

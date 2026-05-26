@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'garmin_auth.dart';
+import 'garmin_webview_login.dart';
 import 'models.dart';
 import 'store.dart';
 
@@ -97,17 +98,21 @@ class ProfileEditScreen extends StatefulWidget {
 }
 
 class _ProfileEditScreenState extends State<ProfileEditScreen> {
-  final _name     = TextEditingController();
-  final _weight   = TextEditingController();
-  final _height   = TextEditingController();
-  final _email    = TextEditingController();
-  final _password = TextEditingController();
-  bool _showPassword = false;
+  final _name         = TextEditingController();
+  final _weight       = TextEditingController();
+  final _height       = TextEditingController();
+  final _email        = TextEditingController();
+  final _password     = TextEditingController();
+  final _manualToken  = TextEditingController();
+  final _manualRefresh = TextEditingController();
+  bool _showPassword    = false;
+  bool _showManualPaste = false;
   String _sex = 'male';
   DateTime _birthDate = DateTime.utc(1990, 1, 1);
   bool _correctValues = false;
   bool _syncEnabled   = true;
-  bool _loggedIn = false;
+  bool _loggedIn    = false;  // password stored (can auto-retry)
+  bool _hasToken    = false;  // active OAuth token obtained
   bool _loginInProgress = false;
   String? _loginError;
 
@@ -148,8 +153,12 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
   }
 
   Future<void> _loadLoginState() async {
-    final pw = await Store.readPassword(_id);
-    if (mounted) setState(() => _loggedIn = pw != null && pw.isNotEmpty);
+    final pw    = await Store.readPassword(_id);
+    final token = await Store.readToken(_id);
+    if (mounted) setState(() {
+      _loggedIn = (pw != null && pw.isNotEmpty) || (token != null && token.isNotEmpty);
+      _hasToken = token != null && token.isNotEmpty;
+    });
   }
 
   Future<void> _doLogin() async {
@@ -185,18 +194,36 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
     try {
       final result = await GarminAuth.login(email, pw);
       await Store.saveToken(_id, result.accessToken);
-      if (mounted) {
-        setState(() => _loginInProgress = false);
-      }
+      if (mounted) setState(() { _loginInProgress = false; _hasToken = true; });
     } catch (e) {
       if (mounted) {
         setState(() {
-          _loginError = 'Login failed but password is saved — background '
-              'uploads will retry when ready.\n\n'
-              '${e.toString().replaceFirst("Exception: ", "")}';
+          _loginError = e.toString().replaceFirst('Exception: ', '');
           _loginInProgress = false;
+          _hasToken = false;
         });
       }
+    }
+  }
+
+  Future<void> _retryLogin() async {
+    final email = _email.text.trim();
+    final pw    = await Store.readPassword(_id);
+    if (email.isEmpty || pw == null || pw.isEmpty) {
+      setState(() => _loginError = 'No stored password — log out and re-enter credentials.');
+      return;
+    }
+    setState(() { _loginInProgress = true; _loginError = null; });
+    try {
+      final result = await GarminAuth.login(email, pw);
+      await Store.saveToken(_id, result.accessToken);
+      if (mounted) setState(() { _loginInProgress = false; _hasToken = true; });
+    } catch (e) {
+      if (mounted) setState(() {
+        _loginError = e.toString().replaceFirst('Exception: ', '');
+        _loginInProgress = false;
+        _hasToken = false;
+      });
     }
   }
 
@@ -206,15 +233,58 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
       setState(() => _loginError = 'Enter Garmin email above first.');
       return;
     }
-    // WebView login can't capture password, only token. Warn the user.
-    setState(() => _loginError =
-        'WebView login captures the token but not the password, so auto-refresh will not work. '
-        'Use the Native button instead unless you have MFA enabled.');
+    final saved = await _persistProfile();
+    if (saved == null) return;
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GarminWebViewLogin(
+          onTokenReceived: (accessToken, refreshToken) async {
+            await Store.saveToken(_id, accessToken);
+            if (refreshToken != null && refreshToken.isNotEmpty) {
+              await Store.saveRefreshToken(_id, refreshToken);
+            }
+            if (mounted) setState(() { _loggedIn = true; _hasToken = true; _loginError = null; });
+          },
+        ),
+      ),
+    );
+  }
+
+  void _toggleManualPaste() {
+    setState(() {
+      _showManualPaste = !_showManualPaste;
+      _loginError = null;
+    });
+  }
+
+  Future<void> _saveManualToken() async {
+    final token = _manualToken.text.trim();
+    if (token.isEmpty) {
+      setState(() => _loginError = 'Paste the access token first.');
+      return;
+    }
+    final saved = await _persistProfile();
+    if (saved == null) return;
+    await Store.saveToken(_id, token);
+    final refresh = _manualRefresh.text.trim();
+    if (refresh.isNotEmpty) await Store.saveRefreshToken(_id, refresh);
+    _manualToken.clear();
+    _manualRefresh.clear();
+    if (mounted) {
+      setState(() {
+        _loggedIn = true;
+        _hasToken = true;
+        _showManualPaste = false;
+        _loginError = null;
+      });
+    }
   }
 
   Future<void> _logout() async {
     await Store.clearSecrets(_id);
-    if (mounted) setState(() => _loggedIn = false);
+    if (mounted) setState(() { _loggedIn = false; _hasToken = false; _loginError = null; });
   }
 
   /// Validate inputs, persist to Store, return the saved profile.
@@ -328,22 +398,51 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
             decoration: const InputDecoration(labelText: 'Garmin email', border: OutlineInputBorder()),
           ),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Icon(_loggedIn ? Icons.check_circle : Icons.cancel,
-                  color: _loggedIn ? Colors.green : Colors.grey),
-              const SizedBox(width: 8),
-              Text(_loggedIn ? 'Logged in' : 'Not logged in'),
-            ],
+          // ── Login status row ────────────────────────────────────────────
+          _LoginStatusRow(
+            loggedIn: _loggedIn,
+            hasToken: _hasToken,
+            inProgress: _loginInProgress,
           ),
-          const SizedBox(height: 12),
-          if (_loggedIn)
-            OutlinedButton.icon(
-              onPressed: _logout,
-              icon: const Icon(Icons.logout),
-              label: const Text('Log out'),
-            )
-          else ...[
+          const SizedBox(height: 8),
+          if (_loginError != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                border: Border.all(color: Colors.red.shade200),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                _loginError!,
+                style: TextStyle(fontSize: 12, color: Colors.red.shade900),
+              ),
+            ),
+          const SizedBox(height: 8),
+          if (_loggedIn) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _logout,
+                    icon: const Icon(Icons.logout),
+                    label: const Text('Log out'),
+                  ),
+                ),
+                if (!_hasToken && !_loginInProgress) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _retryLogin,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry login'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ] else ...[
             TextField(
               controller: _password,
               enabled: !_loginInProgress,
@@ -375,13 +474,105 @@ class _ProfileEditScreenState extends State<ProfileEditScreen> {
               icon: const Icon(Icons.public),
               label: const Text('Login (WebView — MFA)'),
             ),
-          ],
-          if (_loginError != null) ...[
             const SizedBox(height: 8),
-            Text(_loginError!, style: const TextStyle(color: Colors.red)),
+            OutlinedButton.icon(
+              onPressed: _toggleManualPaste,
+              icon: Icon(_showManualPaste ? Icons.keyboard_arrow_up : Icons.vpn_key_outlined),
+              label: Text(_showManualPaste ? 'Hide token fields' : 'Paste token manually (MFA)'),
+            ),
+            if (_showManualPaste) ...[
+              const SizedBox(height: 12),
+              const Text(
+                'Run the Python script on your desktop/Pi to get the tokens, '
+                'then paste them here. Access token expires in ~1 hour.',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _manualToken,
+                autocorrect: false,
+                enableSuggestions: false,
+                maxLines: 3,
+                minLines: 1,
+                decoration: const InputDecoration(
+                  labelText: 'Access token',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _manualRefresh,
+                autocorrect: false,
+                enableSuggestions: false,
+                maxLines: 3,
+                minLines: 1,
+                decoration: const InputDecoration(
+                  labelText: 'Refresh token (optional)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                onPressed: _saveManualToken,
+                icon: const Icon(Icons.save_outlined),
+                label: const Text('Save token'),
+                style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
+              ),
+            ],
           ],
         ],
       ),
+    );
+  }
+}
+
+// ── Login status row ──────────────────────────────────────────────────────────
+
+class _LoginStatusRow extends StatelessWidget {
+  final bool loggedIn;
+  final bool hasToken;
+  final bool inProgress;
+  const _LoginStatusRow({
+    required this.loggedIn,
+    required this.hasToken,
+    required this.inProgress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final IconData icon;
+    final Color color;
+    final String label;
+
+    if (inProgress) {
+      icon  = Icons.pending;
+      color = Colors.grey;
+      label = 'Connecting…';
+    } else if (hasToken) {
+      icon  = Icons.check_circle;
+      color = Colors.green;
+      label = 'Connected — active token';
+    } else if (loggedIn) {
+      icon  = Icons.warning_amber_rounded;
+      color = Colors.orange;
+      label = 'Credentials saved — no active token (token fetch failed)';
+    } else {
+      icon  = Icons.cancel;
+      color = Colors.grey;
+      label = 'Not logged in';
+    }
+
+    return Row(
+      children: [
+        inProgress
+            ? SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2, color: color),
+              )
+            : Icon(icon, color: color, size: 20),
+        const SizedBox(width: 8),
+        Expanded(child: Text(label, style: TextStyle(color: color, fontSize: 13))),
+      ],
     );
   }
 }

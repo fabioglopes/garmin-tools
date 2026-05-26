@@ -97,8 +97,9 @@ class Store {
 
   // ── Per-profile secrets (password + token) ───────────────────────────────
 
-  static String _pwKey(String pid)    => 'profile_${pid}_password';
-  static String _tokenKey(String pid) => 'profile_${pid}_token';
+  static String _pwKey(String pid)           => 'profile_${pid}_password';
+  static String _tokenKey(String pid)        => 'profile_${pid}_token';
+  static String _refreshTokenKey(String pid) => 'profile_${pid}_refresh_token';
 
   static Future<void> savePassword(String pid, String password) =>
       _secure.write(key: _pwKey(pid), value: password);
@@ -118,10 +119,20 @@ class Store {
   static Future<void> deleteToken(String pid) =>
       _secure.delete(key: _tokenKey(pid));
 
-  /// Clear everything for a profile (password + token).
+  static Future<void> saveRefreshToken(String pid, String token) =>
+      _secure.write(key: _refreshTokenKey(pid), value: token);
+
+  static Future<String?> readRefreshToken(String pid) =>
+      _secure.read(key: _refreshTokenKey(pid));
+
+  static Future<void> deleteRefreshToken(String pid) =>
+      _secure.delete(key: _refreshTokenKey(pid));
+
+  /// Clear everything for a profile (password + tokens).
   static Future<void> clearSecrets(String pid) async {
     await deletePassword(pid);
     await deleteToken(pid);
+    await deleteRefreshToken(pid);
   }
 
   // ── Internals ────────────────────────────────────────────────────────────

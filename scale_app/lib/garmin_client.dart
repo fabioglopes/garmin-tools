@@ -10,7 +10,7 @@ import 'garmin_auth.dart';
 /// persist it.
 class GarminClient {
   final String  email;
-  final String  password;
+  final String? password; // null for MFA/token-only profiles (no auto-refresh)
   final void Function(String accessToken, String? refreshToken)? onTokenRefreshed;
 
   String? _token;
@@ -18,7 +18,7 @@ class GarminClient {
 
   GarminClient({
     required this.email,
-    required this.password,
+    this.password,
     String? token,
     this.onTokenRefreshed,
   })  : _token = token,
@@ -72,7 +72,8 @@ class GarminClient {
     }
 
     if (resp.statusCode == 401) {
-      throw Exception('Garmin auth failed even after re-login. Check password.');
+      throw Exception('Garmin rejected the token (401). Re-login in the profile '
+          '(WebView/MFA) or paste a fresh token.');
     }
     if ((resp.statusCode ?? 500) >= 400) {
       final preview = resp.data?.toString() ?? '';
@@ -95,7 +96,11 @@ class GarminClient {
   }
 
   Future<void> _refresh() async {
-    final r = await GarminAuth.login(email, password);
+    if (password == null || password!.isEmpty) {
+      throw Exception('Token expired and no password is stored to refresh it. '
+          'Open the profile and log in again (WebView/MFA) or paste a fresh token.');
+    }
+    final r = await GarminAuth.login(email, password!);
     _token = r.accessToken;
     onTokenRefreshed?.call(r.accessToken, r.refreshToken);
   }
